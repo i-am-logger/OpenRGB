@@ -100,7 +100,6 @@ typedef struct
     unsigned int                                        index;
     std::queue<NetworkServerControllerThreadQueueEntry> queue;
     std::mutex                                          queue_mutex;
-    std::mutex                                          start_mutex;
     std::condition_variable                             start_cv;
     std::thread*                                        thread;
     std::atomic<bool>                                   online;
@@ -197,7 +196,7 @@ private:
     std::vector<RGBController*>                     controllers;
     std::vector<NetworkServerControllerThread*>     controller_threads;
     std::shared_mutex                               controller_threads_mutex;
-    bool                                            controller_updating;
+    std::atomic<bool>                               controller_updating;
 
     NetworkServerControllerThread*                  profilemanager_thread;
 

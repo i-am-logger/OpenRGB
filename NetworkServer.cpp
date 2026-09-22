@@ -705,8 +705,10 @@ void NetworkServer::StopServer()
     \*-----------------------------------------------------*/
     if(profilemanager_thread)
     {
+        profilemanager_thread->queue_mutex.lock();
         profilemanager_thread->online = false;
         profilemanager_thread->start_cv.notify_all();
+        profilemanager_thread->queue_mutex.unlock();
         profilemanager_thread->thread->join();
         delete profilemanager_thread->thread;
         delete profilemanager_thread;
@@ -871,8 +873,10 @@ void NetworkServer::SetControllers(std::vector<RGBController *> new_controllers)
     \*-----------------------------------------------------*/
     for(std::size_t controller_thread_old_idx = 0; controller_thread_old_idx < controller_threads_old.size(); controller_thread_old_idx++)
     {
+        controller_threads_old[controller_thread_old_idx]->queue_mutex.lock();
         controller_threads_old[controller_thread_old_idx]->online   = false;
         controller_threads_old[controller_thread_old_idx]->start_cv.notify_all();
+        controller_threads_old[controller_thread_old_idx]->queue_mutex.unlock();
         controller_threads_old[controller_thread_old_idx]->thread->join();
         delete controller_threads_old[controller_thread_old_idx]->thread;
     }
@@ -892,10 +896,22 @@ void NetworkServer::SetControllers(std::vector<RGBController *> new_controllers)
     }
 
     /*-----------------------------------------------------*\
-    | Clear the controller list updating flag to resume the |
-    | controller packet processing                          |
+    | Clear the controller list updating flag and wake the  |
+    | controller threads to resume the controller packet    |
+    | processing                                            |
     \*-----------------------------------------------------*/
     controller_updating = false;
+
+    controller_threads_mutex.lock_shared();
+
+    for(std::size_t controller_thread_idx = 0; controller_thread_idx < controller_threads.size(); controller_thread_idx++)
+    {
+        controller_threads[controller_thread_idx]->queue_mutex.lock();
+        controller_threads[controller_thread_idx]->start_cv.notify_all();
+        controller_threads[controller_thread_idx]->queue_mutex.unlock();
+    }
+
+    controller_threads_mutex.unlock_shared();
 }
 
 void NetworkServer::SetPluginManager(PluginManagerInterface* plugin_manager_pointer)
@@ -1181,63 +1197,58 @@ void NetworkServer::ControllerListenThread(NetworkServerControllerThread* this_t
     while(this_thread->online == true)
     {
         /*-------------------------------------------------*\
-        | Stop processing RGBController packet queues if    |
-        | the controller list is being updated              |
+        | Wait until a packet is queued or the thread is    |
+        | stopped.  Stop processing RGBController packet    |
+        | queues if the controller list is being updated    |
         \*-------------------------------------------------*/
-        if(!controller_updating)
-        {
-            std::unique_lock<std::mutex> start_lock(this_thread->start_mutex);
-            this_thread->start_cv.wait(start_lock);
+        std::unique_lock<std::mutex> queue_lock(this_thread->queue_mutex);
+        this_thread->start_cv.wait(queue_lock, [this, this_thread]{ return !this_thread->online || (!controller_updating && !this_thread->queue.empty()); });
 
-            while(this_thread->queue.size() > 0)
+        while(this_thread->queue.size() > 0)
+        {
+            NetworkServerControllerThreadQueueEntry queue_entry;
+            NetPacketStatus                         status      = NET_PACKET_STATUS_OK;
+
+            queue_entry = this_thread->queue.front();
+            this_thread->queue.pop();
+            queue_lock.unlock();
+
+            controller_ids_mutex.lock_shared();
+
+            switch(queue_entry.header.pkt_id)
             {
-                NetworkServerControllerThreadQueueEntry queue_entry;
-                NetPacketStatus                         status      = NET_PACKET_STATUS_OK;
+                case NET_PACKET_ID_RGBCONTROLLER_UPDATELEDS:
+                    status = ProcessRequest_RGBController_UpdateLEDs(queue_entry.client_info, queue_entry.header.pkt_size, queue_entry.data, this_thread->id);
+                    break;
 
-                this_thread->queue_mutex.lock();
-                queue_entry = this_thread->queue.front();
-                this_thread->queue.pop();
-                this_thread->queue_mutex.unlock();
+                case NET_PACKET_ID_RGBCONTROLLER_UPDATEZONELEDS:
+                    status = ProcessRequest_RGBController_UpdateZoneLEDs(queue_entry.client_info, queue_entry.header.pkt_size, queue_entry.data, this_thread->id);
+                    break;
 
-                controller_ids_mutex.lock_shared();
+                case NET_PACKET_ID_RGBCONTROLLER_UPDATEMODE:
+                    status = ProcessRequest_RGBController_UpdateSaveMode(queue_entry.client_info, queue_entry.header.pkt_size, queue_entry.data, this_thread->id, false);
+                    break;
 
-                switch(queue_entry.header.pkt_id)
-                {
-                    case NET_PACKET_ID_RGBCONTROLLER_UPDATELEDS:
-                        status = ProcessRequest_RGBController_UpdateLEDs(queue_entry.client_info, queue_entry.header.pkt_size, queue_entry.data, this_thread->id);
-                        break;
+                case NET_PACKET_ID_RGBCONTROLLER_SAVEMODE:
+                    status = ProcessRequest_RGBController_UpdateSaveMode(queue_entry.client_info, queue_entry.header.pkt_size, queue_entry.data, this_thread->id, true);
+                    break;
 
-                    case NET_PACKET_ID_RGBCONTROLLER_UPDATEZONELEDS:
-                        status = ProcessRequest_RGBController_UpdateZoneLEDs(queue_entry.client_info, queue_entry.header.pkt_size, queue_entry.data, this_thread->id);
-                        break;
+                case NET_PACKET_ID_RGBCONTROLLER_UPDATEZONEMODE:
+                    status = ProcessRequest_RGBController_UpdateZoneMode(queue_entry.client_info, queue_entry.header.pkt_size, queue_entry.data, this_thread->id);
+                    break;
 
-                    case NET_PACKET_ID_RGBCONTROLLER_UPDATEMODE:
-                        status = ProcessRequest_RGBController_UpdateSaveMode(queue_entry.client_info, queue_entry.header.pkt_size, queue_entry.data, this_thread->id, false);
-                        break;
-
-                    case NET_PACKET_ID_RGBCONTROLLER_SAVEMODE:
-                        status = ProcessRequest_RGBController_UpdateSaveMode(queue_entry.client_info, queue_entry.header.pkt_size, queue_entry.data, this_thread->id, true);
-                        break;
-
-                    case NET_PACKET_ID_RGBCONTROLLER_UPDATEZONEMODE:
-                        status = ProcessRequest_RGBController_UpdateZoneMode(queue_entry.client_info, queue_entry.header.pkt_size, queue_entry.data, this_thread->id);
-                        break;
-
-                    default:
-                        status = NET_PACKET_STATUS_ERROR_UNSUPPORTED;
-                        break;
-                }
-
-                controller_ids_mutex.unlock_shared();
-
-                delete[] queue_entry.data;
-
-                SendAck(queue_entry.client_info, queue_entry.header.pkt_dev_id, queue_entry.header.pkt_id, status);
+                default:
+                    status = NET_PACKET_STATUS_ERROR_UNSUPPORTED;
+                    break;
             }
-        }
-        else
-        {
-            std::this_thread::sleep_for(1ms);
+
+            controller_ids_mutex.unlock_shared();
+
+            delete[] queue_entry.data;
+
+            SendAck(queue_entry.client_info, queue_entry.header.pkt_dev_id, queue_entry.header.pkt_id, status);
+
+            queue_lock.lock();
         }
     }
 }
@@ -1246,18 +1257,17 @@ void NetworkServer::ProfileManagerListenThread(NetworkServerControllerThread* th
 {
     while(this_thread->online == true)
     {
-        std::unique_lock<std::mutex> start_lock(this_thread->start_mutex);
-        this_thread->start_cv.wait(start_lock);
+        std::unique_lock<std::mutex> queue_lock(this_thread->queue_mutex);
+        this_thread->start_cv.wait(queue_lock, [this_thread]{ return !this_thread->online || !this_thread->queue.empty(); });
 
         while(this_thread->queue.size() > 0)
         {
             NetworkServerControllerThreadQueueEntry queue_entry;
             NetPacketStatus                         status      = NET_PACKET_STATUS_OK;
 
-            this_thread->queue_mutex.lock();
             queue_entry = this_thread->queue.front();
             this_thread->queue.pop();
-            this_thread->queue_mutex.unlock();
+            queue_lock.unlock();
 
             switch(queue_entry.header.pkt_id)
             {
@@ -1301,6 +1311,8 @@ void NetworkServer::ProfileManagerListenThread(NetworkServerControllerThread* th
             delete[] queue_entry.data;
 
             SendAck(queue_entry.client_info, queue_entry.header.pkt_dev_id, queue_entry.header.pkt_id, status);
+
+            queue_lock.lock();
         }
     }
 }
@@ -1518,8 +1530,8 @@ void NetworkServer::ListenThreadFunction(NetworkClientInfo* client_info)
                     new_entry.client_info               = client_info;
 
                     profilemanager_thread->queue.push(new_entry);
-                    profilemanager_thread->queue_mutex.unlock();
                     profilemanager_thread->start_cv.notify_all();
+                    profilemanager_thread->queue_mutex.unlock();
 
                     delete_data = false;
                 }
@@ -1630,8 +1642,8 @@ void NetworkServer::ListenThreadFunction(NetworkClientInfo* client_info)
                         new_entry.client_info               = client_info;
 
                         controller_threads[controller_thread_idx]->queue.push(new_entry);
-                        controller_threads[controller_thread_idx]->queue_mutex.unlock();
                         controller_threads[controller_thread_idx]->start_cv.notify_all();
+                        controller_threads[controller_thread_idx]->queue_mutex.unlock();
 
                         delete_data = false;
                     }
