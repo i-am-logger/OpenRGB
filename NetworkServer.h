@@ -184,6 +184,7 @@ private:
     std::string                         server_name;
     std::atomic<bool>                   server_online;
     std::atomic<bool>                   server_listening;
+    std::atomic<int>                    server_listen_pending;
     SOCKET                              server_sock[MAXSOCK];
     int                                 socket_count;
 
