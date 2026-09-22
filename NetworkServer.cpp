@@ -109,14 +109,20 @@ NetworkClientInfo::~NetworkClientInfo()
 
         /*-------------------------------------------------*\
         | Stop the send thread before closing the socket.   |
+        | Clear the running flag and notify while holding   |
+        | the queue mutex, so the stop cannot land between  |
+        | the send thread's queue check and its wait.       |
         | SD_BOTH (not just SD_RECEIVE) unblocks a send     |
         | stuck on a slow client, so the join cannot hang.  |
         \*-------------------------------------------------*/
         if(client_send_thread)
         {
+            client_send_mutex.lock();
             client_send_running = false;
-            shutdown(client_sock, SD_BOTH);
             client_send_cv.notify_all();
+            client_send_mutex.unlock();
+
+            shutdown(client_sock, SD_BOTH);
             client_send_thread->join();
             delete client_send_thread;
             client_send_thread = nullptr;
