@@ -3,6 +3,7 @@ Description=OpenRGB SDK Server
 After=network.target lm_sensors.service
 
 [Service]
+Type=notify
 ExecStart=/usr/bin/openrgb --server --config /etc/openrgb
 Restart=always
 RuntimeDirectory=openrgb

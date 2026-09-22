@@ -37,6 +37,11 @@
 #endif
 
 #ifdef __linux__
+#include <stddef.h>
+#include <sys/un.h>
+#endif
+
+#ifdef __linux__
 const int yes = 1;
 #else
 const char yes = 1;
@@ -150,6 +155,74 @@ static void RGBController_UpdateCallback(void* this_ptr, unsigned int update_rea
     this_obj->SendRequest_RGBController_SignalUpdate((RGBController*)controller_ptr, update_reason);
 }
 
+/*---------------------------------------------------------*\
+| NotifyServiceManagerReady                                 |
+|                                                           |
+|   Tell the service manager (systemd) that the server is   |
+|   ready, using the sd_notify datagram protocol.  Does     |
+|   nothing unless NOTIFY_SOCKET is set in the environment, |
+|   as it is for a Type=notify service.  NOTIFY_SOCKET is   |
+|   a socket path, or an abstract socket name if it starts  |
+|   with '@'.                                               |
+\*---------------------------------------------------------*/
+static void NotifyServiceManagerReady()
+{
+#ifdef __linux__
+    const char*         notify_socket   = getenv("NOTIFY_SOCKET");
+    const char*         notify_message  = "READY=1";
+    struct sockaddr_un  notify_addr;
+    std::size_t         notify_socket_len;
+    int                 notify_sock;
+
+    if(notify_socket == NULL || notify_socket[0] == '\0')
+    {
+        return;
+    }
+
+    notify_socket_len = strlen(notify_socket);
+
+    if((notify_socket[0] != '/' && notify_socket[0] != '@') || notify_socket_len > sizeof(notify_addr.sun_path))
+    {
+        LOG_ERROR("[%s] Unsupported NOTIFY_SOCKET address %s, service manager not notified", NETWORKSERVER, notify_socket);
+        return;
+    }
+
+    /*-----------------------------------------------------*\
+    | Fill in the socket address.  An abstract socket name  |
+    | begins with a NUL byte in place of the '@' and is not |
+    | NUL terminated, so the address length is the same for |
+    | both address types.                                   |
+    \*-----------------------------------------------------*/
+    memset(&notify_addr, 0, sizeof(notify_addr));
+    notify_addr.sun_family = AF_UNIX;
+    memcpy(notify_addr.sun_path, notify_socket, notify_socket_len);
+
+    if(notify_addr.sun_path[0] == '@')
+    {
+        notify_addr.sun_path[0] = '\0';
+    }
+
+    notify_sock = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+
+    if(notify_sock < 0)
+    {
+        LOG_ERROR("[%s] Could not create service manager notification socket. Error code: %d.", NETWORKSERVER, errno);
+        return;
+    }
+
+    if(sendto(notify_sock, notify_message, strlen(notify_message), MSG_NOSIGNAL, (struct sockaddr*)&notify_addr, (socklen_t)(offsetof(struct sockaddr_un, sun_path) + notify_socket_len)) < 0)
+    {
+        LOG_ERROR("[%s] Could not notify service manager that the server is ready. Error code: %d.", NETWORKSERVER, errno);
+    }
+    else
+    {
+        LOG_INFO("[%s] Notified service manager that the server is ready", NETWORKSERVER);
+    }
+
+    close(notify_sock);
+#endif
+}
+
 NetworkServer::NetworkServer()
 {
     host                        = OPENRGB_SDK_HOST;
@@ -157,6 +230,7 @@ NetworkServer::NetworkServer()
     server_hostname             = GetHostname();
     server_online               = false;
     server_listening            = false;
+    server_listen_pending       = 0;
     legacy_workaround_enabled   = false;
     controller_next_idx         = 0;
     controller_updating         = false;
@@ -577,6 +651,13 @@ void NetworkServer::StartServer()
     profilemanager_thread->thread                   = new std::thread(&NetworkServer::ProfileManagerListenThread, this, profilemanager_thread);
 
     /*-----------------------------------------------------*\
+    | Each connection thread counts this down when its      |
+    | socket starts listening.  The server is ready once    |
+    | all of the sockets are listening.                     |
+    \*-----------------------------------------------------*/
+    server_listen_pending = socket_count;
+
+    /*-----------------------------------------------------*\
     | Start the connection thread                           |
     \*-----------------------------------------------------*/
     for(int curr_socket = 0; curr_socket < socket_count; curr_socket++)
@@ -957,6 +1038,8 @@ void NetworkServer::SignalServerListeningChanged()
 \*---------------------------------------------------------*/
 void NetworkServer::ConnectionThreadFunction(int socket_idx)
 {
+    bool socket_listening = false;
+
     /*-----------------------------------------------------*\
     | This thread handles client connections                |
     \*-----------------------------------------------------*/
@@ -984,6 +1067,24 @@ void NetworkServer::ConnectionThreadFunction(int socket_idx)
 
         server_listening = true;
         SignalServerListeningChanged();
+
+        /*-------------------------------------------------*\
+        | The first time this socket listens, count it.  If |
+        | it is the last socket to start listening, notify  |
+        | the service manager that the server is ready.  A  |
+        | socket that fails to bind or listen is never      |
+        | counted, so readiness is never signaled for a     |
+        | server that is not fully listening.               |
+        \*-------------------------------------------------*/
+        if(!socket_listening)
+        {
+            socket_listening = true;
+
+            if(--server_listen_pending == 0)
+            {
+                NotifyServiceManagerReady();
+            }
+        }
 
         /*-------------------------------------------------*\
         | Accept the client connection                      |
