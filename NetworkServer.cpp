@@ -675,14 +675,25 @@ void NetworkServer::StartServer()
 
 void NetworkServer::StopServer()
 {
-    int curr_socket;
+    int                             curr_socket;
+    std::vector<NetworkClientInfo*> stopped_clients;
     server_online = false;
 
     ServerClientsMutex.lock();
 
-    for(unsigned int client_idx = 0; client_idx < ServerClients.size(); client_idx++)
+    /*-----------------------------------------------------*\
+    | Take the clients out of the list, so that their       |
+    | listen threads do not delete them, and shut down      |
+    | their sockets to unblock any send stuck on a slow     |
+    | client.  They are deleted after the ProfileManager    |
+    | thread has stopped, as its queue entries point at     |
+    | the clients that sent them.                           |
+    \*-----------------------------------------------------*/
+    stopped_clients = ServerClients;
+
+    for(unsigned int client_idx = 0; client_idx < stopped_clients.size(); client_idx++)
     {
-        delete ServerClients[client_idx];
+        shutdown(stopped_clients[client_idx]->client_sock, SD_BOTH);
     }
 
     ServerClients.clear();
@@ -707,7 +718,8 @@ void NetworkServer::StopServer()
     socket_count = 0;
 
     /*-----------------------------------------------------*\
-    | Close the ProfileManager listen thread                |
+    | Close the ProfileManager listen thread.  It processes |
+    | its remaining queue entries before it exits.          |
     \*-----------------------------------------------------*/
     if(profilemanager_thread)
     {
@@ -719,6 +731,15 @@ void NetworkServer::StopServer()
         delete profilemanager_thread->thread;
         delete profilemanager_thread;
         profilemanager_thread = nullptr;
+    }
+
+    /*-----------------------------------------------------*\
+    | Delete the clients now that the ProfileManager thread |
+    | is no longer using them                               |
+    \*-----------------------------------------------------*/
+    for(unsigned int client_idx = 0; client_idx < stopped_clients.size(); client_idx++)
+    {
+        delete stopped_clients[client_idx];
     }
 
     /*-----------------------------------------------------*\
