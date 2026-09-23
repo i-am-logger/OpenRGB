@@ -81,16 +81,17 @@ public:
     std::atomic<bool>                                                              client_send_running;
 
     /*-----------------------------------------------------*\
-    | Number of this client's requests that are waiting in  |
-    | a controller or ProfileManager queue or are being     |
-    | processed by that thread.  The client is deleted only |
-    | once this is zero, as each of those requests points   |
-    | at it.  Leaf lock: nothing else is locked while       |
-    | client_pending_mutex is held.                         |
+    | References to this client from outside its listen     |
+    | thread: one for each of its requests that is waiting  |
+    | in a controller or ProfileManager queue or is being   |
+    | processed by that thread, and one for each signal     |
+    | being sent to it.  Its listen thread deletes it only  |
+    | once this is zero.  Leaf lock: nothing else is locked |
+    | while client_refs_mutex is held.                      |
     \*-----------------------------------------------------*/
-    unsigned int                                                                   client_pending_requests;
-    std::mutex                                                                     client_pending_mutex;
-    std::condition_variable                                                        client_pending_cv;
+    unsigned int                                                                   client_refs;
+    std::mutex                                                                     client_refs_mutex;
+    std::condition_variable                                                        client_refs_cv;
 };
 
 typedef struct
@@ -216,9 +217,16 @@ private:
     NetworkServerControllerThread*                  profilemanager_thread;
 
     /*-----------------------------------------------------*\
-    | Server clients                                        |
+    | Server clients.  ServerClients is changed only while  |
+    | both ServerClientsMutex and ServerClientsListMutex    |
+    | are held, so holding either one is enough to read it. |
+    | ServerClientsListMutex is held only while the list is |
+    | changed, or copied with its clients referenced, and   |
+    | nothing but a client_refs_mutex is locked under it,   |
+    | so it can be taken with any other lock held.          |
     \*-----------------------------------------------------*/
     std::mutex                          ServerClientsMutex;
+    std::mutex                          ServerClientsListMutex;
     std::vector<NetworkClientInfo*>     ServerClients;
     std::thread*                        ConnectionThread[MAXSOCK];
 
@@ -361,8 +369,11 @@ private:
     | Private helper functions                              |
     \*-----------------------------------------------------*/
     int                                 accept_select(int sockfd);
-    void                                finish_request(NetworkClientInfo* client_info);
+    void                                acquire_client(NetworkClientInfo* client_info);
+    std::vector<NetworkClientInfo*>     acquire_clients();
     unsigned int                        index_from_id(unsigned int id, unsigned int protocol_version, bool* index_valid);
     bool                                queue_request(NetworkServerControllerThread* queue_thread, NetworkClientInfo* client_info, NetPacketHeader header, unsigned char* data);
     int                                 recv_select(SOCKET s, char *buf, int len, int flags);
+    void                                release_client(NetworkClientInfo* client_info);
+    void                                release_clients(std::vector<NetworkClientInfo*>& clients);
 };
