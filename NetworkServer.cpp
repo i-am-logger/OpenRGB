@@ -104,7 +104,7 @@ NetworkClientInfo::NetworkClientInfo()
     client_is_local_client  = false;
     client_send_thread      = nullptr;
     client_send_running     = false;
-    client_pending_requests = 0;
+    client_refs             = 0;
 }
 
 NetworkClientInfo::~NetworkClientInfo()
@@ -323,6 +323,8 @@ bool NetworkServer::GetListening()
 
 unsigned int NetworkServer::GetNumClients()
 {
+    std::lock_guard<std::mutex> list_lock(ServerClientsListMutex);
+
     return((unsigned int)ServerClients.size());
 }
 
@@ -411,7 +413,15 @@ unsigned int NetworkServer::GetClientProtocolVersion(unsigned int client_num)
 \*---------------------------------------------------------*/
 void NetworkServer::SignalLogManagerLoggedEntry(LogMessage& logged_entry)
 {
-    if(ServerClients.size() > 0)
+    /*-----------------------------------------------------*\
+    | LogManager calls this on every LOG_* call, which can  |
+    | be made with ServerClientsMutex held, so the clients  |
+    | are taken with acquire_clients(), which does not lock |
+    | it                                                    |
+    \*-----------------------------------------------------*/
+    std::vector<NetworkClientInfo*> clients = acquire_clients();
+
+    if(clients.size() > 0)
     {
         /*-------------------------------------------------*\
         | Create data buffer for message                    |
@@ -459,16 +469,18 @@ void NetworkServer::SignalLogManagerLoggedEntry(LogMessage& logged_entry)
         /*-------------------------------------------------*\
         | Send Logged Entry request for all clients         |
         \*-------------------------------------------------*/
-        for(unsigned int client_idx = 0; client_idx < ServerClients.size(); client_idx++)
+        for(std::size_t client_idx = 0; client_idx < clients.size(); client_idx++)
         {
-            if(ServerClients[client_idx]->client_is_local_client)
+            if(clients[client_idx]->client_is_local_client)
             {
-                SendRequest_LoggedEntry(ServerClients[client_idx], data_size, data_buf);
+                SendRequest_LoggedEntry(clients[client_idx], data_size, data_buf);
             }
         }
 
         delete[] data_buf;
     }
+
+    release_clients(clients);
 }
 
 void NetworkServer::SignalProfileManagerUpdate(unsigned int update_reason)
@@ -542,17 +554,24 @@ void NetworkServer::SetLegacyWorkaroundEnable(bool enable)
 void NetworkServer::SetName(std::string new_name)
 {
     /*-----------------------------------------------------*\
-    | Store the server name                                 |
+    | Store the server name.  Client listen threads read it |
+    | under ServerClientsMutex in SendReply_ServerString.   |
     \*-----------------------------------------------------*/
+    ServerClientsMutex.lock();
     server_name = new_name;
+    ServerClientsMutex.unlock();
 
     /*-----------------------------------------------------*\
     | Send server name to all clients                       |
     \*-----------------------------------------------------*/
-    for(std::size_t client_idx = 0; client_idx < ServerClients.size(); client_idx++)
+    std::vector<NetworkClientInfo*> clients = acquire_clients();
+
+    for(std::size_t client_idx = 0; client_idx < clients.size(); client_idx++)
     {
-        SendReply_ServerString(ServerClients[client_idx]);
+        SendReply_ServerString(clients[client_idx]);
     }
+
+    release_clients(clients);
 }
 
 void NetworkServer::SetPort(unsigned short new_port)
@@ -986,13 +1005,17 @@ void NetworkServer::SignalActiveProfileChanged()
         | Indicate to the clients that the profile list has |
         | changed                                           |
         \*-------------------------------------------------*/
-        for(unsigned int client_idx = 0; client_idx < ServerClients.size(); client_idx++)
+        std::vector<NetworkClientInfo*> clients = acquire_clients();
+
+        for(std::size_t client_idx = 0; client_idx < clients.size(); client_idx++)
         {
-            if(ServerClients[client_idx]->client_flags & NET_CLIENT_FLAG_SUPPORTS_PROFILEMANAGER)
+            if(clients[client_idx]->client_flags & NET_CLIENT_FLAG_SUPPORTS_PROFILEMANAGER)
             {
-                SendRequest_ProfileManager_ActiveProfileChanged(ServerClients[client_idx], active_profile);
+                SendRequest_ProfileManager_ActiveProfileChanged(clients[client_idx], active_profile);
             }
         }
+
+        release_clients(clients);
     }
 }
 
@@ -1016,10 +1039,14 @@ void NetworkServer::SignalDetectionCompleted()
     /*-----------------------------------------------------*\
     | Indicate to the clients that detection has completed  |
     \*-----------------------------------------------------*/
-    for(unsigned int client_idx = 0; client_idx < ServerClients.size(); client_idx++)
+    std::vector<NetworkClientInfo*> clients = acquire_clients();
+
+    for(std::size_t client_idx = 0; client_idx < clients.size(); client_idx++)
     {
-        SendRequest_DetectionCompleted(ServerClients[client_idx]);
+        SendRequest_DetectionCompleted(clients[client_idx]);
     }
+
+    release_clients(clients);
 }
 
 void NetworkServer::SignalDetectionProgress()
@@ -1030,10 +1057,14 @@ void NetworkServer::SignalDetectionProgress()
     /*-----------------------------------------------------*\
     | Indicate to the clients detection progress changed    |
     \*-----------------------------------------------------*/
-    for(unsigned int client_idx = 0; client_idx < ServerClients.size(); client_idx++)
+    std::vector<NetworkClientInfo*> clients = acquire_clients();
+
+    for(std::size_t client_idx = 0; client_idx < clients.size(); client_idx++)
     {
-        SendRequest_DetectionProgress(ServerClients[client_idx], detection_percent, detection_string);
+        SendRequest_DetectionProgress(clients[client_idx], detection_percent, detection_string);
     }
+
+    release_clients(clients);
 }
 
 void NetworkServer::SignalDetectionStarted()
@@ -1041,10 +1072,14 @@ void NetworkServer::SignalDetectionStarted()
     /*-----------------------------------------------------*\
     | Indicate to the clients that detection has started    |
     \*-----------------------------------------------------*/
-    for(unsigned int client_idx = 0; client_idx < ServerClients.size(); client_idx++)
+    std::vector<NetworkClientInfo*> clients = acquire_clients();
+
+    for(std::size_t client_idx = 0; client_idx < clients.size(); client_idx++)
     {
-        SendRequest_DetectionStarted(ServerClients[client_idx]);
+        SendRequest_DetectionStarted(clients[client_idx]);
     }
+
+    release_clients(clients);
 }
 
 void NetworkServer::SignalDeviceListUpdated()
@@ -1053,10 +1088,14 @@ void NetworkServer::SignalDeviceListUpdated()
     | Indicate to the clients that the controller list has  |
     | changed                                               |
     \*-----------------------------------------------------*/
-    for(unsigned int client_idx = 0; client_idx < ServerClients.size(); client_idx++)
+    std::vector<NetworkClientInfo*> clients = acquire_clients();
+
+    for(std::size_t client_idx = 0; client_idx < clients.size(); client_idx++)
     {
-        SendRequest_DeviceListChanged(ServerClients[client_idx]);
+        SendRequest_DeviceListChanged(clients[client_idx]);
     }
+
+    release_clients(clients);
 }
 
 void NetworkServer::SignalProfileListUpdated()
@@ -1069,10 +1108,14 @@ void NetworkServer::SignalProfileListUpdated()
         | Indicate to the clients that the profile list has |
         | changed                                           |
         \*-------------------------------------------------*/
-        for(unsigned int client_idx = 0; client_idx < ServerClients.size(); client_idx++)
+        std::vector<NetworkClientInfo*> clients = acquire_clients();
+
+        for(std::size_t client_idx = 0; client_idx < clients.size(); client_idx++)
         {
-            SendRequest_ProfileManager_ProfileListChanged(ServerClients[client_idx], profile_list_description);
+            SendRequest_ProfileManager_ProfileListChanged(clients[client_idx], profile_list_description);
         }
+
+        release_clients(clients);
 
         delete[] profile_list_description;
     }
@@ -1236,7 +1279,10 @@ void NetworkServer::ConnectionThreadFunction(int socket_idx)
         client_info->client_send_running = true;
         client_info->client_send_thread  = new std::thread(&NetworkServer::ClientSendThreadFunction, this, client_info);
 
+        ServerClientsListMutex.lock();
         ServerClients.push_back(client_info);
+        ServerClientsListMutex.unlock();
+
         ServerClientsRunning++;
         ServerClientsMutex.unlock();
 
@@ -1309,7 +1355,7 @@ void NetworkServer::ControllerListenThread(NetworkServerControllerThread* this_t
 
             SendAck(queue_entry.client_info, queue_entry.header.pkt_dev_id, queue_entry.header.pkt_id, status);
 
-            finish_request(queue_entry.client_info);
+            release_client(queue_entry.client_info);
 
             queue_lock.lock();
         }
@@ -1387,7 +1433,7 @@ void NetworkServer::ProfileManagerListenThread(NetworkServerControllerThread* th
 
             SendAck(queue_entry.client_info, queue_entry.header.pkt_dev_id, queue_entry.header.pkt_id, status);
 
-            finish_request(queue_entry.client_info);
+            release_client(queue_entry.client_info);
 
             queue_lock.lock();
         }
@@ -1789,6 +1835,7 @@ listen_done:
     | it.                                                   |
     \*-----------------------------------------------------*/
     ServerClientsMutex.lock();
+    ServerClientsListMutex.lock();
 
     for(unsigned int this_idx = 0; this_idx < ServerClients.size(); this_idx++)
     {
@@ -1799,18 +1846,21 @@ listen_done:
         }
     }
 
+    ServerClientsListMutex.unlock();
     ServerClientsMutex.unlock();
 
     shutdown(client_sock, SD_BOTH);
 
     /*-----------------------------------------------------*\
-    | Wait until the controller and ProfileManager threads  |
-    | have finished every request this client queued, then  |
-    | delete it                                             |
+    | Wait until nothing references the client: every       |
+    | request it queued to a controller or ProfileManager   |
+    | thread is done, and no signal is being sent to it.    |
+    | Nothing can take a new reference, as the client is    |
+    | out of the list.  Then delete it.                     |
     \*-----------------------------------------------------*/
     {
-        std::unique_lock<std::mutex> pending_lock(client_info->client_pending_mutex);
-        client_info->client_pending_cv.wait(pending_lock, [client_info]{ return client_info->client_pending_requests == 0; });
+        std::unique_lock<std::mutex> refs_lock(client_info->client_refs_mutex);
+        client_info->client_refs_cv.wait(refs_lock, [client_info]{ return client_info->client_refs == 0; });
     }
 
     delete client_info;
@@ -4295,11 +4345,13 @@ void NetworkServer::SendRequest_ProfileManager_ActiveProfileChanged(std::string 
 
     InitNetPacketHeader(&pkt_hdr, 0, NET_PACKET_ID_PROFILEMANAGER_ACTIVE_PROFILE_CHANGED, (unsigned int)strlen(profile_name.c_str()) + 1);
 
-    for(std::size_t client_idx = 0; client_idx < ServerClients.size(); client_idx++)
+    std::vector<NetworkClientInfo*> clients = acquire_clients();
+
+    for(std::size_t client_idx = 0; client_idx < clients.size(); client_idx++)
     {
-        if(ServerClients[client_idx]->client_flags & NET_CLIENT_FLAG_SUPPORTS_PROFILEMANAGER)
+        if(clients[client_idx]->client_flags & NET_CLIENT_FLAG_SUPPORTS_PROFILEMANAGER)
         {
-            SOCKET client_sock = ServerClients[client_idx]->client_sock;
+            SOCKET client_sock = clients[client_idx]->client_sock;
 
             send_in_progress.lock();
             send(client_sock, (char *)&pkt_hdr, sizeof(NetPacketHeader), MSG_NOSIGNAL);
@@ -4307,6 +4359,8 @@ void NetworkServer::SendRequest_ProfileManager_ActiveProfileChanged(std::string 
             send_in_progress.unlock();
         }
     }
+
+    release_clients(clients);
 }
 
 void NetworkServer::SendRequest_ProfileManager_ProfileAboutToLoad()
@@ -4318,19 +4372,23 @@ void NetworkServer::SendRequest_ProfileManager_ProfileAboutToLoad()
     profile_about_to_load_acks = 0;
     profile_about_to_load_count = 0;
 
-    for(std::size_t client_idx = 0; client_idx < ServerClients.size(); client_idx++)
+    std::vector<NetworkClientInfo*> clients = acquire_clients();
+
+    for(std::size_t client_idx = 0; client_idx < clients.size(); client_idx++)
     {
-        if(ServerClients[client_idx]->client_flags & NET_CLIENT_FLAG_SUPPORTS_PROFILEMANAGER)
+        if(clients[client_idx]->client_flags & NET_CLIENT_FLAG_SUPPORTS_PROFILEMANAGER)
         {
             profile_about_to_load_count++;
 
-            SOCKET client_sock = ServerClients[client_idx]->client_sock;
+            SOCKET client_sock = clients[client_idx]->client_sock;
 
             send_in_progress.lock();
             send(client_sock, (char *)&pkt_hdr, sizeof(NetPacketHeader), MSG_NOSIGNAL);
             send_in_progress.unlock();
         }
     }
+
+    release_clients(clients);
 }
 
 void NetworkServer::SendRequest_ProfileManager_ProfileListChanged(NetworkClientInfo* client_info, unsigned char* profile_list_description)
@@ -4354,11 +4412,13 @@ void NetworkServer::SendRequest_ProfileManager_ProfileLoaded(std::string profile
 
     InitNetPacketHeader(&pkt_hdr, 0, NET_PACKET_ID_PROFILEMANAGER_PROFILE_LOADED, (unsigned int)strlen(profile_json_string.c_str()) + 1);
 
-    for(std::size_t client_idx = 0; client_idx < ServerClients.size(); client_idx++)
+    std::vector<NetworkClientInfo*> clients = acquire_clients();
+
+    for(std::size_t client_idx = 0; client_idx < clients.size(); client_idx++)
     {
-        if((ServerClients[client_idx]->client_flags & NET_CLIENT_FLAG_SUPPORTS_PROFILEMANAGER) && (ServerClients[client_idx]->client_is_local_client))
+        if((clients[client_idx]->client_flags & NET_CLIENT_FLAG_SUPPORTS_PROFILEMANAGER) && (clients[client_idx]->client_is_local_client))
         {
-            SOCKET client_sock = ServerClients[client_idx]->client_sock;
+            SOCKET client_sock = clients[client_idx]->client_sock;
 
             send_in_progress.lock();
             send(client_sock, (char *)&pkt_hdr, sizeof(NetPacketHeader), MSG_NOSIGNAL);
@@ -4366,6 +4426,8 @@ void NetworkServer::SendRequest_ProfileManager_ProfileLoaded(std::string profile
             send_in_progress.unlock();
         }
     }
+
+    release_clients(clients);
 }
 
 void NetworkServer::SendRequest_RGBController_SignalUpdate(RGBController * controller_ptr, unsigned int update_reason)
@@ -4661,17 +4723,43 @@ int NetworkServer::accept_select(int sockfd)
 }
 
 /*---------------------------------------------------------*\
-| Called by a controller or ProfileManager thread once it   |
-| has finished a request, ACK included.  The client may be  |
-| deleted as soon as client_pending_mutex is released, so   |
-| the caller must not use client_info after this returns.   |
+| Take a reference that keeps a client from being deleted   |
+| until release_client() drops it.  The client must be one  |
+| that cannot have been deleted yet: the caller is its own  |
+| listen thread, or holds a ServerClients lock and found it |
+| in the list.                                              |
 \*---------------------------------------------------------*/
-void NetworkServer::finish_request(NetworkClientInfo* client_info)
+void NetworkServer::acquire_client(NetworkClientInfo* client_info)
 {
-    std::lock_guard<std::mutex> pending_lock(client_info->client_pending_mutex);
+    std::lock_guard<std::mutex> refs_lock(client_info->client_refs_mutex);
 
-    client_info->client_pending_requests--;
-    client_info->client_pending_cv.notify_all();
+    client_info->client_refs++;
+}
+
+/*---------------------------------------------------------*\
+| Return a copy of ServerClients with every client in it    |
+| referenced, so the caller can send to them without        |
+| holding a lock, then pass the copy to release_clients().  |
+|                                                           |
+| Only ServerClientsListMutex and client_refs_mutex are     |
+| taken, and nothing else is locked under either, so this   |
+| is safe whatever locks the caller holds.  Signals come    |
+| from the detection, ProfileManager and GUI threads, and   |
+| from LogManager on every LOG_* call, including calls made |
+| while ServerClientsMutex is held.                         |
+\*---------------------------------------------------------*/
+std::vector<NetworkClientInfo*> NetworkServer::acquire_clients()
+{
+    std::lock_guard<std::mutex> list_lock(ServerClientsListMutex);
+
+    std::vector<NetworkClientInfo*> clients = ServerClients;
+
+    for(std::size_t client_idx = 0; client_idx < clients.size(); client_idx++)
+    {
+        acquire_client(clients[client_idx]);
+    }
+
+    return(clients);
 }
 
 unsigned int NetworkServer::index_from_id(unsigned int id, unsigned int protocol_version, bool* index_valid)
@@ -4716,12 +4804,12 @@ unsigned int NetworkServer::index_from_id(unsigned int id, unsigned int protocol
 
 /*---------------------------------------------------------*\
 | Queue a request from a client to a controller or          |
-| ProfileManager thread, counting it as pending for that    |
-| client until the thread calls finish_request().  The      |
-| request is only queued while the thread is running, so a  |
-| stopped thread never holds a request that it will not     |
-| process.  On success the queue entry takes ownership of   |
-| data.                                                     |
+| ProfileManager thread.  Called by the client's listen     |
+| thread.  The queue entry holds a reference to the client  |
+| until the thread calls release_client().  The request is  |
+| only queued while the thread is running, so a stopped     |
+| thread never holds a request that it will not process.    |
+| On success the queue entry takes ownership of data.       |
 \*---------------------------------------------------------*/
 bool NetworkServer::queue_request(NetworkServerControllerThread* queue_thread, NetworkClientInfo* client_info, NetPacketHeader header, unsigned char* data)
 {
@@ -4737,9 +4825,7 @@ bool NetworkServer::queue_request(NetworkServerControllerThread* queue_thread, N
     new_entry.header                    = header;
     new_entry.client_info               = client_info;
 
-    client_info->client_pending_mutex.lock();
-    client_info->client_pending_requests++;
-    client_info->client_pending_mutex.unlock();
+    acquire_client(client_info);
 
     queue_thread->queue.push(new_entry);
     queue_thread->start_cv.notify_all();
@@ -4782,4 +4868,31 @@ int NetworkServer::recv_select(SOCKET s, char *buf, int len, int flags)
             return(recv(s, buf, len, flags));
         }
     }
+}
+
+/*---------------------------------------------------------*\
+| Drop a reference taken by acquire_client().  The client   |
+| may be deleted as soon as client_refs_mutex is released,  |
+| so the caller must not use client_info after this         |
+| returns.                                                  |
+\*---------------------------------------------------------*/
+void NetworkServer::release_client(NetworkClientInfo* client_info)
+{
+    std::lock_guard<std::mutex> refs_lock(client_info->client_refs_mutex);
+
+    client_info->client_refs--;
+    client_info->client_refs_cv.notify_all();
+}
+
+/*---------------------------------------------------------*\
+| Drop the references that acquire_clients() took           |
+\*---------------------------------------------------------*/
+void NetworkServer::release_clients(std::vector<NetworkClientInfo*>& clients)
+{
+    for(std::size_t client_idx = 0; client_idx < clients.size(); client_idx++)
+    {
+        release_client(clients[client_idx]);
+    }
+
+    clients.clear();
 }
