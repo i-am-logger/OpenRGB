@@ -99,6 +99,7 @@ NetworkClientInfo::NetworkClientInfo()
     client_is_local_client  = false;
     client_send_thread      = nullptr;
     client_send_running     = false;
+    client_pending_requests = 0;
 }
 
 NetworkClientInfo::~NetworkClientInfo()
@@ -179,15 +180,37 @@ NetworkServer::NetworkServer()
         ConnectionThread[i]     = nullptr;
     }
 
+    ServerClientsRunning        = 0;
+    socket_count                = 0;
+
     plugin_manager              = nullptr;
     profile_manager             = nullptr;
-    profilemanager_thread       = nullptr;
     settings_manager            = nullptr;
+
+    /*-----------------------------------------------------*\
+    | The ProfileManager queue lives as long as the server, |
+    | so a client listen thread never sees it deleted.      |
+    | StartServer starts its thread.                        |
+    \*-----------------------------------------------------*/
+    profilemanager_thread           = new NetworkServerControllerThread;
+    profilemanager_thread->id       = 0;
+    profilemanager_thread->index    = 0;
+    profilemanager_thread->online   = false;
+    profilemanager_thread->thread   = nullptr;
 }
 
 NetworkServer::~NetworkServer()
 {
     StopServer();
+
+    /*-----------------------------------------------------*\
+    | Wait until every client's listen thread has deleted   |
+    | its client and stopped using the server               |
+    \*-----------------------------------------------------*/
+    {
+        std::unique_lock<std::mutex> clients_lock(ServerClientsMutex);
+        ServerClientsCv.wait(clients_lock, [this]{ return ServerClientsRunning == 0; });
+    }
 
     /*-----------------------------------------------------*\
     | Unregister the server's RGBController update handler  |
@@ -197,6 +220,8 @@ NetworkServer::~NetworkServer()
     {
         controllers[controller_idx]->UnregisterUpdateCallback(this);
     }
+
+    delete profilemanager_thread;
 }
 
 /*---------------------------------------------------------*\
@@ -570,17 +595,19 @@ void NetworkServer::StartServer()
     }
 
     freeaddrinfo(result);
-    server_online = true;
 
     /*-----------------------------------------------------*\
-    | Start the ProfileManager thread                       |
+    | Start the ProfileManager thread before the server     |
+    | goes online, so it is running before any client can   |
+    | queue a request to it                                 |
     \*-----------------------------------------------------*/
-    profilemanager_thread                           = new NetworkServerControllerThread;
+    if(profilemanager_thread->thread == nullptr)
+    {
+        profilemanager_thread->online               = true;
+        profilemanager_thread->thread               = new std::thread(&NetworkServer::ProfileManagerListenThread, this, profilemanager_thread);
+    }
 
-    profilemanager_thread->id                       = 0;
-    profilemanager_thread->index                    = 0;
-    profilemanager_thread->online                   = true;
-    profilemanager_thread->thread                   = new std::thread(&NetworkServer::ProfileManagerListenThread, this, profilemanager_thread);
+    server_online = true;
 
     /*-----------------------------------------------------*\
     | Start the connection thread                           |
@@ -594,28 +621,23 @@ void NetworkServer::StartServer()
 
 void NetworkServer::StopServer()
 {
-    int                             curr_socket;
-    std::vector<NetworkClientInfo*> stopped_clients;
+    int curr_socket;
+
     server_online = false;
 
     ServerClientsMutex.lock();
 
     /*-----------------------------------------------------*\
-    | Take the clients out of the list, so that their       |
-    | listen threads do not delete them, and shut down      |
-    | their sockets to unblock any send stuck on a slow     |
-    | client.  They are deleted after the ProfileManager    |
-    | thread has stopped, as its queue entries point at     |
-    | the clients that sent them.                           |
+    | Shut down every client's socket.  This unblocks any   |
+    | send stuck on a slow client, and each client's listen |
+    | thread sees it and deletes its client once the        |
+    | client's queued requests are done.  No client is      |
+    | added once server_online is false.                    |
     \*-----------------------------------------------------*/
-    stopped_clients = ServerClients;
-
-    for(unsigned int client_idx = 0; client_idx < stopped_clients.size(); client_idx++)
+    for(unsigned int client_idx = 0; client_idx < ServerClients.size(); client_idx++)
     {
-        shutdown(stopped_clients[client_idx]->client_sock, SD_BOTH);
+        shutdown(ServerClients[client_idx]->client_sock, SD_BOTH);
     }
-
-    ServerClients.clear();
 
     for(curr_socket = 0; curr_socket < socket_count; curr_socket++)
     {
@@ -638,9 +660,14 @@ void NetworkServer::StopServer()
 
     /*-----------------------------------------------------*\
     | Close the ProfileManager listen thread.  It processes |
-    | its remaining queue entries before it exits.          |
+    | its remaining queue entries before it exits, and      |
+    | nothing is queued to it once it is stopped.           |
+    |                                                       |
+    | This does not wait for the client listen threads: one |
+    | handling a rescan request can be waiting for the GUI  |
+    | thread, which is where the server page calls this.    |
     \*-----------------------------------------------------*/
-    if(profilemanager_thread)
+    if(profilemanager_thread->thread)
     {
         profilemanager_thread->queue_mutex.lock();
         profilemanager_thread->online = false;
@@ -648,17 +675,7 @@ void NetworkServer::StopServer()
         profilemanager_thread->queue_mutex.unlock();
         profilemanager_thread->thread->join();
         delete profilemanager_thread->thread;
-        delete profilemanager_thread;
-        profilemanager_thread = nullptr;
-    }
-
-    /*-----------------------------------------------------*\
-    | Delete the clients now that the ProfileManager thread |
-    | is no longer using them                               |
-    \*-----------------------------------------------------*/
-    for(unsigned int client_idx = 0; client_idx < stopped_clients.size(); client_idx++)
-    {
-        delete stopped_clients[client_idx];
+        profilemanager_thread->thread = nullptr;
     }
 
     /*-----------------------------------------------------*\
@@ -1090,6 +1107,21 @@ void NetworkServer::ConnectionThreadFunction(int socket_idx)
         ServerClientsMutex.lock();
 
         /*---------------------------------------------------------*\
+        | If StopServer has started since the accept, close the     |
+        | connection instead.  StopServer only shuts down the       |
+        | clients already in the list, and no client may start      |
+        | once the server is stopping.                              |
+        \*---------------------------------------------------------*/
+        if(server_online == false)
+        {
+            ServerClientsMutex.unlock();
+
+            delete client_info;
+
+            break;
+        }
+
+        /*---------------------------------------------------------*\
         | Start a listener thread for the new client socket         |
         \*---------------------------------------------------------*/
         client_info->client_listen_thread = new std::thread(&NetworkServer::ListenThreadFunction, this, client_info);
@@ -1104,6 +1136,7 @@ void NetworkServer::ConnectionThreadFunction(int socket_idx)
         client_info->client_send_thread  = new std::thread(&NetworkServer::ClientSendThreadFunction, this, client_info);
 
         ServerClients.push_back(client_info);
+        ServerClientsRunning++;
         ServerClientsMutex.unlock();
 
         /*-------------------------------------------------*\
@@ -1120,14 +1153,15 @@ void NetworkServer::ConnectionThreadFunction(int socket_idx)
 
 void NetworkServer::ControllerListenThread(NetworkServerControllerThread* this_thread)
 {
-    while(this_thread->online == true)
+    std::unique_lock<std::mutex> queue_lock(this_thread->queue_mutex);
+
+    while(true)
     {
         /*-------------------------------------------------*\
         | Wait until a packet is queued or the thread is    |
         | stopped.  Stop processing RGBController packet    |
         | queues if the controller list is being updated    |
         \*-------------------------------------------------*/
-        std::unique_lock<std::mutex> queue_lock(this_thread->queue_mutex);
         this_thread->start_cv.wait(queue_lock, [this, this_thread]{ return !this_thread->online || (!controller_updating && !this_thread->queue.empty()); });
 
         while(this_thread->queue.size() > 0)
@@ -1174,16 +1208,30 @@ void NetworkServer::ControllerListenThread(NetworkServerControllerThread* this_t
 
             SendAck(queue_entry.client_info, queue_entry.header.pkt_dev_id, queue_entry.header.pkt_id, status);
 
+            finish_request(queue_entry.client_info);
+
             queue_lock.lock();
+        }
+
+        /*-------------------------------------------------*\
+        | Exit only once the thread is stopped and its      |
+        | queue is empty, both seen under queue_mutex.      |
+        | Nothing is queued to a stopped thread, so every   |
+        | queued packet has been processed and ACKed.       |
+        \*-------------------------------------------------*/
+        if(!this_thread->online)
+        {
+            break;
         }
     }
 }
 
 void NetworkServer::ProfileManagerListenThread(NetworkServerControllerThread* this_thread)
 {
-    while(this_thread->online == true)
+    std::unique_lock<std::mutex> queue_lock(this_thread->queue_mutex);
+
+    while(true)
     {
-        std::unique_lock<std::mutex> queue_lock(this_thread->queue_mutex);
         this_thread->start_cv.wait(queue_lock, [this_thread]{ return !this_thread->online || !this_thread->queue.empty(); });
 
         while(this_thread->queue.size() > 0)
@@ -1238,7 +1286,18 @@ void NetworkServer::ProfileManagerListenThread(NetworkServerControllerThread* th
 
             SendAck(queue_entry.client_info, queue_entry.header.pkt_dev_id, queue_entry.header.pkt_id, status);
 
+            finish_request(queue_entry.client_info);
+
             queue_lock.lock();
+        }
+
+        /*-------------------------------------------------*\
+        | Exit only once the thread is stopped and its      |
+        | queue is empty, both seen under queue_mutex       |
+        \*-------------------------------------------------*/
+        if(!this_thread->online)
+        {
+            break;
         }
     }
 }
@@ -1447,19 +1506,13 @@ void NetworkServer::ListenThreadFunction(NetworkClientInfo* client_info)
             case NET_PACKET_ID_PROFILEMANAGER_DOWNLOAD_PROFILE:
             case NET_PACKET_ID_PROFILEMANAGER_GET_ACTIVE_PROFILE:
             case NET_PACKET_ID_PROFILEMANAGER_CLEAR_ACTIVE_PROFILE:
+                if(queue_request(profilemanager_thread, client_info, header, data))
                 {
-                    profilemanager_thread->queue_mutex.lock();
-
-                    NetworkServerControllerThreadQueueEntry new_entry;
-                    new_entry.data                      = data;
-                    new_entry.header                    = header;
-                    new_entry.client_info               = client_info;
-
-                    profilemanager_thread->queue.push(new_entry);
-                    profilemanager_thread->start_cv.notify_all();
-                    profilemanager_thread->queue_mutex.unlock();
-
                     delete_data = false;
+                }
+                else
+                {
+                    status = NET_PACKET_STATUS_ERROR_GENERIC;
                 }
                 break;
 
@@ -1560,18 +1613,14 @@ void NetworkServer::ListenThreadFunction(NetworkClientInfo* client_info)
                     \*-------------------------------------*/
                     if(match)
                     {
-                        controller_threads[controller_thread_idx]->queue_mutex.lock();
-
-                        NetworkServerControllerThreadQueueEntry new_entry;
-                        new_entry.data                      = data;
-                        new_entry.header                    = header;
-                        new_entry.client_info               = client_info;
-
-                        controller_threads[controller_thread_idx]->queue.push(new_entry);
-                        controller_threads[controller_thread_idx]->start_cv.notify_all();
-                        controller_threads[controller_thread_idx]->queue_mutex.unlock();
-
-                        delete_data = false;
+                        if(queue_request(controller_threads[controller_thread_idx], client_info, header, data))
+                        {
+                            delete_data = false;
+                        }
+                        else
+                        {
+                            status = NET_PACKET_STATUS_ERROR_GENERIC;
+                        }
                     }
 
                     controller_threads_mutex.unlock_shared();
@@ -1629,26 +1678,56 @@ void NetworkServer::ListenThreadFunction(NetworkClientInfo* client_info)
 
 listen_done:
 
+    /*-----------------------------------------------------*\
+    | Take the client out of the list, so nothing new is    |
+    | sent to it, and shut its socket down, so the replies  |
+    | and ACKs to its remaining requests fail at once       |
+    | instead of blocking.  The socket stays open until the |
+    | client is deleted, so its descriptor cannot be reused |
+    | by a new connection while a request still points at   |
+    | it.                                                   |
+    \*-----------------------------------------------------*/
     ServerClientsMutex.lock();
 
     for(unsigned int this_idx = 0; this_idx < ServerClients.size(); this_idx++)
     {
         if(ServerClients[this_idx] == client_info)
         {
-            delete client_info;
             ServerClients.erase(ServerClients.begin() + this_idx);
             break;
         }
     }
 
-    client_info = nullptr;
-
     ServerClientsMutex.unlock();
+
+    shutdown(client_sock, SD_BOTH);
+
+    /*-----------------------------------------------------*\
+    | Wait until the controller and ProfileManager threads  |
+    | have finished every request this client queued, then  |
+    | delete it                                             |
+    \*-----------------------------------------------------*/
+    {
+        std::unique_lock<std::mutex> pending_lock(client_info->client_pending_mutex);
+        client_info->client_pending_cv.wait(pending_lock, [client_info]{ return client_info->client_pending_requests == 0; });
+    }
+
+    delete client_info;
+    client_info = nullptr;
 
     /*-----------------------------------------------------*\
     | Client info has changed, call the callbacks           |
     \*-----------------------------------------------------*/
     SignalClientInfoChanged();
+
+    /*-----------------------------------------------------*\
+    | This is the thread's last access to the server; the   |
+    | server's destructor may proceed once it is done       |
+    \*-----------------------------------------------------*/
+    ServerClientsMutex.lock();
+    ServerClientsRunning--;
+    ServerClientsCv.notify_all();
+    ServerClientsMutex.unlock();
 }
 
 /*---------------------------------------------------------*\
@@ -4480,6 +4559,20 @@ int NetworkServer::accept_select(int sockfd)
     }
 }
 
+/*---------------------------------------------------------*\
+| Called by a controller or ProfileManager thread once it   |
+| has finished a request, ACK included.  The client may be  |
+| deleted as soon as client_pending_mutex is released, so   |
+| the caller must not use client_info after this returns.   |
+\*---------------------------------------------------------*/
+void NetworkServer::finish_request(NetworkClientInfo* client_info)
+{
+    std::lock_guard<std::mutex> pending_lock(client_info->client_pending_mutex);
+
+    client_info->client_pending_requests--;
+    client_info->client_pending_cv.notify_all();
+}
+
 unsigned int NetworkServer::index_from_id(unsigned int id, unsigned int protocol_version, bool* index_valid)
 {
     /*-----------------------------------------------------*\
@@ -4518,6 +4611,39 @@ unsigned int NetworkServer::index_from_id(unsigned int id, unsigned int protocol
     }
 
     return(index);
+}
+
+/*---------------------------------------------------------*\
+| Queue a request from a client to a controller or          |
+| ProfileManager thread, counting it as pending for that    |
+| client until the thread calls finish_request().  The      |
+| request is only queued while the thread is running, so a  |
+| stopped thread never holds a request that it will not     |
+| process.  On success the queue entry takes ownership of   |
+| data.                                                     |
+\*---------------------------------------------------------*/
+bool NetworkServer::queue_request(NetworkServerControllerThread* queue_thread, NetworkClientInfo* client_info, NetPacketHeader header, unsigned char* data)
+{
+    std::lock_guard<std::mutex> queue_lock(queue_thread->queue_mutex);
+
+    if(!queue_thread->online)
+    {
+        return(false);
+    }
+
+    NetworkServerControllerThreadQueueEntry new_entry;
+    new_entry.data                      = data;
+    new_entry.header                    = header;
+    new_entry.client_info               = client_info;
+
+    client_info->client_pending_mutex.lock();
+    client_info->client_pending_requests++;
+    client_info->client_pending_mutex.unlock();
+
+    queue_thread->queue.push(new_entry);
+    queue_thread->start_cv.notify_all();
+
+    return(true);
 }
 
 int NetworkServer::recv_select(SOCKET s, char *buf, int len, int flags)

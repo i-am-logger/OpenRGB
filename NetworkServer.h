@@ -79,6 +79,18 @@ public:
     std::condition_variable                                                        client_send_cv;
     std::thread*                                                                   client_send_thread;
     std::atomic<bool>                                                              client_send_running;
+
+    /*-----------------------------------------------------*\
+    | Number of this client's requests that are waiting in  |
+    | a controller or ProfileManager queue or are being     |
+    | processed by that thread.  The client is deleted only |
+    | once this is zero, as each of those requests points   |
+    | at it.  Leaf lock: nothing else is locked while       |
+    | client_pending_mutex is held.                         |
+    \*-----------------------------------------------------*/
+    unsigned int                                                                   client_pending_requests;
+    std::mutex                                                                     client_pending_mutex;
+    std::condition_variable                                                        client_pending_cv;
 };
 
 typedef struct
@@ -197,6 +209,10 @@ private:
     std::shared_mutex                               controller_threads_mutex;
     std::atomic<bool>                               controller_updating;
 
+    /*-----------------------------------------------------*\
+    | Allocated for the lifetime of the server; its thread  |
+    | runs from StartServer until StopServer                |
+    \*-----------------------------------------------------*/
     NetworkServerControllerThread*                  profilemanager_thread;
 
     /*-----------------------------------------------------*\
@@ -205,6 +221,16 @@ private:
     std::mutex                          ServerClientsMutex;
     std::vector<NetworkClientInfo*>     ServerClients;
     std::thread*                        ConnectionThread[MAXSOCK];
+
+    /*-----------------------------------------------------*\
+    | Number of client listen threads still running,        |
+    | including those already out of ServerClients that are |
+    | waiting to delete their client.  Guarded by           |
+    | ServerClientsMutex; the destructor waits on           |
+    | ServerClientsCv for it to reach zero.                 |
+    \*-----------------------------------------------------*/
+    unsigned int                        ServerClientsRunning;
+    std::condition_variable             ServerClientsCv;
 
     /*-----------------------------------------------------*\
     | Client information change callbacks                   |
@@ -335,6 +361,8 @@ private:
     | Private helper functions                              |
     \*-----------------------------------------------------*/
     int                                 accept_select(int sockfd);
+    void                                finish_request(NetworkClientInfo* client_info);
     unsigned int                        index_from_id(unsigned int id, unsigned int protocol_version, bool* index_valid);
+    bool                                queue_request(NetworkServerControllerThread* queue_thread, NetworkClientInfo* client_info, NetPacketHeader header, unsigned char* data);
     int                                 recv_select(SOCKET s, char *buf, int len, int flags);
 };
